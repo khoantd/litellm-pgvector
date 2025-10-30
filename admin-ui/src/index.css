@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --radius: 8px;
+}
+
+body { @apply bg-background text-foreground; }
