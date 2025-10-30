@@ -5,6 +5,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from prisma import Prisma
 from dotenv import load_dotenv
 
@@ -21,7 +22,7 @@ from models import (
     VectorStoreListResponse,
     ContentChunk
 )
-from config import settings
+from config import settings, settings_manager
 from embedding_service import embedding_service
 
 load_dotenv()
@@ -41,15 +42,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Optionally serve admin UI if built and present
+try:
+    app.mount("/admin", StaticFiles(directory="static/admin", html=True), name="admin")
+except Exception:
+    # Static admin not available in dev; ignore
+    pass
+
 # Global Prisma client
 db = Prisma()
 
 security = HTTPBearer()
+def _on_settings_applied(old, new):
+    try:
+        if (old.embedding.model != new.embedding.model or
+            old.embedding.base_url != new.embedding.base_url or
+            old.embedding.api_key != new.embedding.api_key or
+            old.embedding.dimensions != new.embedding.dimensions):
+            # Hot-apply embedding configuration
+            embedding_service.update_config(new.embedding)
+    except Exception:
+        pass
+
+settings_manager.register_on_apply(_on_settings_applied)
+
 
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Validate API key from Authorization header"""
-    expected_key = settings.server_api_key
+    expected_key = settings_manager.effective.server_api_key
     if credentials.credentials != expected_key:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return credentials.credentials
@@ -59,6 +80,12 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
 async def startup():
     """Connect to database on startup"""
     await db.connect()
+    # Load admin overlays from DB and apply
+    try:
+        await settings_manager.load_overlay_from_db(db)
+    except Exception:
+        # Continue with base settings if overlay load fails
+        pass
 
 
 @app.on_event("shutdown")
@@ -519,4 +546,125 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=True) 
+    uvicorn.run("main:app", host=settings_manager.effective.host, port=settings_manager.effective.port, reload=True)
+
+
+# -----------------------------
+# Admin settings API (secured)
+# -----------------------------
+
+from fastapi import APIRouter
+
+admin_router = APIRouter(prefix="/v1/admin", dependencies=[Depends(get_api_key)])
+
+
+def _redact_secrets(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return val
+    return "***" if len(val) > 0 else val
+
+
+@admin_router.get("/settings")
+async def get_settings():
+    eff = settings_manager.effective
+    return {
+        "server": {
+            "host": eff.host,
+            "port": eff.port,
+        },
+        "auth": {
+            "server_api_key": _redact_secrets(eff.server_api_key),
+        },
+        "embedding": {
+            "model": eff.embedding.model,
+            "base_url": eff.embedding.base_url,
+            "api_key": _redact_secrets(eff.embedding.api_key),
+            "dimensions": eff.embedding.dimensions,
+        },
+        "db_fields": eff.db_fields.model_dump(),
+    }
+
+
+@admin_router.get("/settings/schema")
+async def get_settings_schema():
+    return {
+        "groups": {
+            "server": {"fields": {"host": {"type": "string"}, "port": {"type": "integer", "min": 1, "max": 65535}}},
+            "auth": {"fields": {"server_api_key": {"type": "secret"}}},
+            "embedding": {
+                "fields": {
+                    "model": {"type": "string"},
+                    "base_url": {"type": "string"},
+                    "api_key": {"type": "secret"},
+                    "dimensions": {"type": "integer", "min": 1}
+                }
+            },
+            "db_fields": {
+                "fields": {
+                    "id_field": {"type": "string"},
+                    "content_field": {"type": "string"},
+                    "metadata_field": {"type": "string"},
+                    "embedding_field": {"type": "string"},
+                    "vector_store_id_field": {"type": "string"},
+                    "created_at_field": {"type": "string"}
+                }
+            }
+        }
+    }
+
+
+@admin_router.put("/settings")
+async def update_settings(payload: dict):
+    # Split payload into groups and upsert each as JSON into app_settings
+    groups = {k: v for k, v in payload.items() if k in {"server", "auth", "embedding", "db_fields", "cors"}}
+
+    if not groups:
+        raise HTTPException(status_code=400, detail="No valid setting groups provided")
+
+    # Build upsert queries
+    # INSERT ... ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
+    for group_key, group_val in groups.items():
+        await db.query_raw(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()
+            """,
+            group_key,
+            group_val,
+        )
+
+    # Reload overlay and apply
+    await settings_manager.load_overlay_from_db(db)
+
+    return {"status": "ok"}
+
+
+@admin_router.post("/settings/test")
+async def test_connectivity():
+    # Test DB
+    try:
+        _ = await db.query_raw("SELECT 1")
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+
+    # Test embedding provider with a tiny request
+    emb_ok = True
+    emb_err = None
+    try:
+        _ = await embedding_service.generate_embedding("ping")
+    except Exception as e:
+        emb_ok = False
+        emb_err = str(e)
+
+    result = {"database": {"ok": db_ok}, "embedding": {"ok": emb_ok}}
+    if not db_ok:
+        result["database"]["error"] = db_err
+    if not emb_ok:
+        result["embedding"]["error"] = emb_err
+    return result
+
+
+app.include_router(admin_router)

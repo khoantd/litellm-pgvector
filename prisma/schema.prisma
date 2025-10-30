@@ -38,3 +38,12 @@ model Embedding {
   
   @@map("embeddings")
 } 
+
+model AppSetting {
+  key        String   @id
+  value      Json?
+  updated_at DateTime @updatedAt
+  updated_by String?
+
+  @@map("app_settings")
+}

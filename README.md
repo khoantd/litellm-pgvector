@@ -13,6 +13,21 @@ A FastAPI application that provides OpenAI-compatible vector store endpoints usi
 
 ## API Endpoints
 
+Authentication
+- All secured endpoints require: `Authorization: Bearer <SERVER_API_KEY>`
+- The effective key can be set via `.env` or Admin UI; Admin UI overrides env immediately.
+
+Interactive API docs
+- Swagger UI: `http://localhost:8000/docs` (click Authorize to set Bearer key)
+- ReDoc: `http://localhost:8000/redoc`
+- OpenAPI JSON: `http://localhost:8000/openapi.json`
+
+Health
+```
+GET /health
+200 { "status": "healthy", "timestamp": 1730000000 }
+```
+
 ### 1. Create Vector Store
 ```bash
 curl -X POST \
@@ -88,6 +103,41 @@ curl -X POST \
     "filters": {"category": "support"}
   }'
 ```
+
+### Admin Settings (secured)
+
+Get effective settings (secrets redacted):
+```bash
+curl -H "Authorization: Bearer $SERVER_API_KEY" http://localhost:8000/v1/admin/settings
+```
+
+Update settings (only include fields you want to change; omit redacted/unchanged secrets):
+```bash
+curl -X PUT \
+  http://localhost:8000/v1/admin/settings \
+  -H "Authorization: Bearer $SERVER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "server": {"host": "0.0.0.0", "port": 8000},
+    "embedding": {"model": "text-embedding-3-small", "base_url": "http://localhost:4000"}
+  }'
+```
+
+Test connectivity (DB + embeddings):
+```bash
+curl -X POST -H "Authorization: Bearer $SERVER_API_KEY" http://localhost:8000/v1/admin/settings/test
+```
+
+Get editable schema:
+```bash
+curl -H "Authorization: Bearer $SERVER_API_KEY" http://localhost:8000/v1/admin/settings/schema
+```
+
+### Error responses
+- 401 {"detail":"Invalid API key"} → wrong/expired key
+- 403 → missing Authorization header
+- 404 → not found
+- 500 → server/database error
 
 ## Configuration
 
@@ -191,6 +241,55 @@ docker build -t vector-store-api .
 # Run the container
 docker run -p 8000:8000 --env-file .env vector-store-api
 ```
+
+### Production image build script
+
+Use the helper script to build a production image, including the Admin UI assets.
+
+Requirements
+- Docker with Buildx enabled (Docker Desktop includes it)
+- Node/npm available locally to build the Admin UI
+
+Build locally (loads into your Docker daemon):
+```bash
+bash scripts/build-image.sh
+# customize
+IMAGE_NAME=my-registry/vector-store-api IMAGE_TAG=latest PLATFORM=linux/amd64 bash scripts/build-image.sh
+```
+
+Build and push to a registry:
+```bash
+IMAGE_NAME=ghcr.io/you/vector-store-api \
+IMAGE_TAG=prod-$(date +%Y%m%d) \
+PLATFORM=linux/amd64 \
+PUSH=true \
+bash scripts/build-image.sh
+```
+
+Run the image (container listens on 8003 by default in Dockerfile):
+```bash
+docker run --rm -p 8000:8003 --env-file .env my-registry/vector-store-api:latest
+```
+
+## Admin UI (Configuration)
+
+An optional admin UI is bundled to manage runtime settings persisted in Postgres.
+
+- URL: `http://localhost:8000/admin`
+- Auth: Uses the same `SERVER_API_KEY`. Enter it in the UI once; it is stored in your browser only.
+- Backing store: `app_settings` table (created via Prisma). Env values remain defaults; DB rows overlay them.
+
+Admin API:
+
+- `GET /v1/admin/settings` returns effective settings (secrets redacted)
+- `PUT /v1/admin/settings` updates groups: `server`, `auth`, `embedding`, `db_fields`, `cors`
+- `POST /v1/admin/settings/test` validates DB and embedding connectivity
+- `GET /v1/admin/settings/schema` describes editable fields
+
+Notes:
+
+- Changes apply without restart. Embedding settings are hot-applied to new requests.
+- Secrets (API keys) are write-only; reads return redacted values.
 
 ## Database Schema
 

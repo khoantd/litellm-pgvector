@@ -1,3 +1,10 @@
+FROM node:18-alpine AS admin_builder
+WORKDIR /ui
+COPY admin-ui/package.json admin-ui/tsconfig.json admin-ui/vite.config.ts ./
+COPY admin-ui/index.html ./index.html
+COPY admin-ui/src ./src
+RUN npm ci || npm i && npm run build
+
 FROM python:3.11-slim
 
 # Set environment variables
@@ -22,6 +29,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project
 COPY . .
 
+# Copy built admin UI
+COPY --from=admin_builder /ui/dist /app/static/admin
+
 # Generate Prisma client
 RUN prisma generate
 
@@ -29,4 +39,4 @@ RUN prisma generate
 EXPOSE 8000
 
 # Command to run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"] 
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"] 

@@ -1,0 +1,151 @@
+{
+  "project": {
+    "name": "OpenAI-compatible Vector Stores API (FastAPI + PGVector)",
+    "summary": "FastAPI service exposing OpenAI Vector Store-like endpoints backed by Postgres + pgvector, Prisma Python client, and embeddings via LiteLLM proxy.",
+    "stack": [
+      "Python 3.11",
+      "FastAPI",
+      "Uvicorn",
+      "Prisma (prisma-client-py)",
+      "PostgreSQL + pgvector",
+      "Pydantic v2",
+      "LiteLLM (proxy for embeddings)",
+      "Docker"
+    ]
+  },
+  "entrypoints": {
+    "app": "main.py",
+    "dockerfile": "Dockerfile",
+    "schema": "prisma/schema.prisma"
+  },
+  "run": {
+    "local": [
+      "pip install -r requirements.txt",
+      "prisma generate",
+      "prisma db push",
+      "uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    ],
+    "env_file": ".env",
+    "env_required": [
+      "DATABASE_URL",
+      "OPENAI_API_KEY (if calling OpenAI directly; not required for LiteLLM)",
+      "HOST",
+      "PORT",
+      "EMBEDDING__MODEL",
+      "EMBEDDING__BASE_URL",
+      "EMBEDDING__API_KEY",
+      "EMBEDDING__DIMENSIONS",
+      "DB_FIELDS__ID_FIELD",
+      "DB_FIELDS__CONTENT_FIELD",
+      "DB_FIELDS__METADATA_FIELD",
+      "DB_FIELDS__EMBEDDING_FIELD",
+      "DB_FIELDS__VECTOR_STORE_ID_FIELD",
+      "DB_FIELDS__CREATED_AT_FIELD",
+      "SERVER_API_KEY ( Authorization: Bearer <key> )"
+    ],
+    "docker": [
+      "docker build -t vector-store-api .",
+      "docker run -p 8000:8000 --env-file .env vector-store-api"
+    ],
+    "health": "GET /health"
+  },
+  "api_contract": {
+    "auth": "HTTP Bearer token must equal settings.server_api_key",
+    "base_paths": ["/v1/vector_stores", "/vector_stores"],
+    "endpoints": {
+      "POST /v1/vector_stores": "Create vector store",
+      "GET /v1/vector_stores": "List vector stores (limit, after, before)",
+      "POST /v1/vector_stores/{vector_store_id}/search": "Similarity search with optional metadata filters",
+      "POST /vector_stores/{vector_store_id}/search": "Legacy/alt route (same contract)",
+      "POST /v1/vector_stores/{vector_store_id}/embeddings": "Insert single embedding",
+      "POST /v1/vector_stores/{vector_store_id}/embeddings/batch": "Batch insert embeddings",
+      "GET /health": "Health check"
+    },
+    "response_models": "Defined in models.py (Pydantic v2)"
+  },
+  "data_model": {
+    "tables": [
+      {
+        "name": "vector_stores",
+        "fields": ["id", "name", "file_counts", "status", "usage_bytes", "created_at", "expires_after", "expires_at", "last_active_at", "metadata"]
+      },
+      {
+        "name": "embeddings",
+        "fields": ["id", "vector_store_id", "content", "embedding (vector(1536))", "metadata", "created_at"]
+      }
+    ],
+    "prisma_schema": "prisma/schema.prisma",
+    "field_mapping": "config.DatabaseFieldConfig controls db field names used in raw SQL"
+  },
+  "embedding": {
+    "source": "LiteLLM proxy via litellm.aembedding",
+    "config": "config.EmbeddingConfig (model, base_url, api_key, dimensions)",
+    "file": "embedding_service.py",
+    "notes": "Embedding dimensions must match config.dimensions; batch and single helpers provided"
+  },
+  "files": {
+    "main.py": "FastAPI app, routes, auth, DB access via Prisma.query_raw, vector math, pagination",
+    "models.py": "Pydantic models for request/response schemas",
+    "config.py": "Settings via pydantic-settings; env-nested delimiter __ supported",
+    "embedding_service.py": "Async embedding generation using LiteLLM proxy",
+    "prisma/schema.prisma": "Database schema and table mappings",
+    "Dockerfile": "Container build and runtime",
+    "README.md": "Usage, endpoints, setup"
+  },
+  "constraints": [
+    "Do not break existing API paths or response shapes (OpenAI-compatible).",
+    "Preserve async patterns; avoid blocking I/O in request handlers.",
+    "Keep raw SQL placeholders and parameter ordering compatible with Prisma query_raw.",
+    "Respect configurable DB field names from settings.db_fields everywhere.",
+    "Do not change embedding dimensionality without updating schema + config coherently.",
+    "Avoid schema changes unless Prisma schema and migrations are updated in tandem.",
+    "Preserve auth behavior: Authorization: Bearer must equal settings.server_api_key.",
+    "Do not introduce heavy logging at INFO in hot paths; prefer DEBUG level guarded logs."
+  ],
+  "safe_improvements": [
+    "Add robust error messages and trace logging under DEBUG.",
+    "Validate request limits (cap at 100 as implemented) and inputs (types, sizes).",
+    "Extend search pagination (has_more/next_page) without changing current defaults.",
+    "Improve metadata filtering ergonomics while keeping JSONB query semantics.",
+    "Add ci-friendly startup checks for database availability.",
+    "Optional: configurable CORS origins via env."
+  ],
+  "anti_patterns": [
+    "Blocking network or file I/O inside request handlers without asyncio-friendly libs.",
+    "Hardcoding table/field names instead of using settings.db_fields and settings.table_names.",
+    "Catching broad Exceptions without returning meaningful HTTP errors.",
+    "Converting embeddings to incorrect vector formats for pgvector.",
+    "Increasing default limits beyond safe caps without pagination."
+  ],
+  "how_to_add": {
+    "endpoint": [
+      "Define request/response models in models.py (Pydantic).",
+      "Add FastAPI route in main.py using async def and Depends(get_api_key).",
+      "Use Prisma 'db.query_raw' with parameter placeholders ($1, $2, ...) and settings.db_fields.",
+      "Return Pydantic models; keep timestamps as epoch seconds where applicable."
+    ],
+    "db_field": [
+      "Add to DatabaseFieldConfig in config.py with sensible defaults.",
+      "Reference via settings.db_fields.<field> in SQL queries."
+    ],
+    "embedding_usage": [
+      "Prefer embedding_service.generate_embedding(s) for correctness and validation.",
+      "Ensure returned length == settings.embedding.dimensions before insert/search."
+    ]
+  },
+  "testing": {
+    "manual": [
+      "curl -H 'Authorization: Bearer <key>' http://localhost:8000/health",
+      "Create vector store, add embedding(s), run search as in README examples"
+    ]
+  },
+  "style": {
+    "python": {
+      "naming": "Descriptive, no 1-2 char names; functions verb phrases; variables noun phrases",
+      "types": "Annotate function signatures and public APIs explicitly",
+      "errors": "Use guard clauses; avoid unnecessary try/except; never swallow errors",
+      "comments": "Only for non-obvious rationale and edge cases",
+      "format": "Match existing formatting; avoid unrelated reformatting"
+    }
+  }
+}

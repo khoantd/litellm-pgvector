@@ -6,4 +6,15 @@
   --radius: 8px;
 }
 
-body { @apply bg-background text-foreground; }
+body { @apply bg-background text-foreground min-h-screen antialiased; }
+
+/* Subtle background gradient for modern look */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(1200px 600px at 80% -10%, rgba(59,130,246,0.08), transparent 70%),
+              radial-gradient(900px 500px at -10% 10%, rgba(147,197,253,0.08), transparent 60%);
+  z-index: 0;
+}

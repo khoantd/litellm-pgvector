@@ -2,3 +2,26 @@
 __pycache__/*
 venv/*
 venv
+.venv
+.venv/*
+*.pyc
+.DS_Store
+
+# Prisma engine artifacts
+node_modules/.prisma/**
+.prisma/**
+
+# Admin UI (Vite/Node)
+admin-ui/node_modules/**
+admin-ui/dist/**
+admin-ui/.vite/**
+admin-ui/.eslintcache
+admin-ui/.cache/**
+admin-ui/npm-debug.log*
+admin-ui/yarn.lock
+admin-ui/package-lock.json
+
+# Python build
+build/
+dist/
+*.egg-info/
