@@ -90,18 +90,20 @@ Track usage metrics per vector store and provide analytics endpoints.
 - [x] Track metrics in database (usage_logs table with indexes)
 - [x] Provide time-range filtering (daily, weekly, monthly, all)
 - [x] Prometheus-compatible metrics format
-- [ ] Admin UI integration for visualization (future enhancement)
+- [x] Admin UI integration for visualization
 - [x] Low-overhead tracking (async logging with asyncio.create_task)
 
 **Related Files:**
 - `main.py` - Added stats endpoints, metrics logging middleware
 - `models.py` - Added VectorStoreStatsResponse and GlobalStatsResponse models
 - `prisma/schema.prisma` - Added UsageLog model with indexes for efficient querying
+- `admin-ui/src/components/AnalyticsCharts.tsx` - Chart visualization components (bar, pie, period comparison)
+- `admin-ui/src/App.tsx` - Analytics tab with visualizations for endpoints, stores, and trends
 
 ---
 
 ### 4. Rate Limiting & Quotas
-**Status:** Not Started  
+**Status:** ✅ Completed  
 **Priority:** P0  
 **Estimated Effort:** Medium
 
@@ -120,17 +122,19 @@ Implement rate limiting and quotas to prevent abuse and manage resources.
 - `PUT /v1/admin/rate_limits` - Configure limits
 
 **Acceptance Criteria:**
-- [ ] Token bucket or sliding window algorithm
-- [ ] Per-API-key rate limits
-- [ ] Per-vector-store quotas
-- [ ] Configurable via settings
-- [ ] Graceful 429 responses with retry hints
-- [ ] Admin UI for configuration
+- [x] Token bucket or sliding window algorithm
+- [x] Per-API-key rate limits
+- [x] Per-vector-store quotas
+- [x] Configurable via settings
+- [x] Graceful 429 responses with retry hints
+- [x] Admin UI for configuration
 
 **Related Files:**
-- `main.py` - Add rate limiting middleware
-- `config.py` - Add rate limit configuration
-- `prisma/schema.prisma` - Optional: rate_limit_config table
+- `main.py` - Added rate limiting middleware and quota checking
+- `config.py` - Added RateLimitConfig and QuotaConfig with settings overlay support
+- `rate_limiter.py` - Token bucket rate limiter implementation with automatic cleanup
+- `models.py` - Added rate limit and quota request/response models
+- `admin-ui/src/App.tsx` - Added rate limit and quota configuration UI
 
 ---
 
@@ -572,7 +576,7 @@ Update this backlog as features are:
 
 **Last Updated:** 2024-01-XX  
 **Total Features:** 18  
-**Completed:** 3  
+**Completed:** 4 (Embedding CRUD, Hybrid Search, Usage Analytics & Monitoring, Rate Limiting & Quotas)  
 **In Progress:** 0
 
 

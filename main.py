@@ -9,6 +9,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from prisma import Prisma
 from dotenv import load_dotenv
 import anyio
@@ -38,12 +39,20 @@ from models import (
     FileIngestResponse,
     FileIngestResult,
     EmbeddingListResponse,
-    EmbeddingListItem
+    EmbeddingListItem,
+    RateLimitConfigRequest,
+    RateLimitConfigResponse,
+    QuotaConfigRequest,
+    QuotaConfigResponse,
+    RateLimitResponse
 )
 from config import settings, settings_manager
 from embedding_service import embedding_service
 from ingestion.text_extractors import extract_text_from_upload, ExtractedPart
 from ingestion.chunking import chunk_text
+from rate_limiter import rate_limiter
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 
@@ -51,7 +60,7 @@ app = FastAPI(
     title="OpenAI Vector Stores API",
     description="OpenAI-compatible Vector Stores API using PGVector",
     version="1.0.0",
-    openapi_url="/openapi.json",
+    openapi_url="/v1/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -102,10 +111,129 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
     return credentials.credentials
 
 
+async def check_rate_limit_middleware(request: Request, call_next):
+    """
+    Middleware to check rate limits for all protected endpoints.
+    Skips rate limiting for health check and admin endpoints.
+    """
+    # Skip rate limiting for health check
+    if request.url.path == "/health" or request.url.path == "/metrics":
+        return await call_next(request)
+    
+    # Skip rate limiting for admin endpoints (they're protected by auth)
+    if request.url.path.startswith("/v1/admin"):
+        return await call_next(request)
+    
+    # Skip rate limiting if disabled
+    rate_limit_config = settings_manager.effective.rate_limit
+    if not rate_limit_config.enabled:
+        return await call_next(request)
+    
+    # Extract API key from header
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        # Not authenticated - let the endpoint handle it
+        return await call_next(request)
+    
+    api_key = auth_header[7:]  # Remove "Bearer " prefix
+    
+    # Check rate limit
+    allowed, retry_after = await rate_limiter.check_rate_limit(
+        key=api_key,
+        requests_per_second=rate_limit_config.requests_per_second,
+        requests_per_minute=rate_limit_config.requests_per_minute,
+        burst_size=rate_limit_config.burst_size
+    )
+    
+    if not allowed:
+        # Return 429 with Retry-After header
+        retry_after_seconds = int(retry_after) if retry_after else 1
+        response = JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limit_exceeded",
+                "message": "Rate limit exceeded. Please try again later.",
+                "retry_after": retry_after_seconds
+            }
+        )
+        response.headers["Retry-After"] = str(retry_after_seconds)
+        return response
+    
+    return await call_next(request)
+
+
+async def check_quota(vector_store_id: str, new_storage_bytes: int = 0, new_embedding_count: int = 0):
+    """
+    Check if operation would exceed quota limits.
+    
+    Args:
+        vector_store_id: ID of the vector store
+        new_storage_bytes: Additional storage bytes to add
+        new_embedding_count: Additional embeddings to add
+        
+    Raises:
+        HTTPException with 429 status if quota would be exceeded
+    """
+    quota_config = settings_manager.effective.quota
+    if not quota_config.enabled:
+        return
+    
+    vector_store_table = settings.table_names["vector_stores"]
+    embeddings_table = settings.table_names["embeddings"]
+    fields = settings.db_fields
+    
+    # Get current usage
+    result = await db.query_raw(
+        f"""
+        SELECT 
+            COALESCE(usage_bytes, 0) as current_storage_bytes,
+            (SELECT COUNT(*) FROM {embeddings_table} WHERE {fields.vector_store_id_field} = $1) as current_embedding_count
+        FROM {vector_store_table}
+        WHERE id = $1
+        """,
+        vector_store_id
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+    
+    current_storage = result[0]["current_storage_bytes"] or 0
+    current_embedding_count = result[0]["current_embedding_count"] or 0
+    
+    # Check storage quota
+    if quota_config.max_storage_bytes is not None:
+        new_total_storage = current_storage + new_storage_bytes
+        if new_total_storage > quota_config.max_storage_bytes:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Storage quota exceeded. Current: {current_storage} bytes, Limit: {quota_config.max_storage_bytes} bytes"
+            )
+    
+    # Check embedding count quota
+    if quota_config.max_embedding_count is not None:
+        new_total_embeddings = current_embedding_count + new_embedding_count
+        if new_total_embeddings > quota_config.max_embedding_count:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Embedding count quota exceeded. Current: {current_embedding_count}, Limit: {quota_config.max_embedding_count}"
+            )
+
+
+# Add rate limiting middleware
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        return await check_rate_limit_middleware(request, call_next)
+
+app.add_middleware(RateLimitMiddleware)
+
+
 @app.on_event("startup")
 async def startup():
     """Connect to database on startup"""
     await db.connect()
+    
+    # Start rate limiter cleanup task
+    await rate_limiter.start_cleanup_task()
     
     # Optionally run migrations on startup (set AUTO_MIGRATE=true in env)
     # Prisma db push is incremental: it adds new tables/columns without dropping existing ones
@@ -810,6 +938,10 @@ async def create_embedding(
         if not vector_store_result:
             raise HTTPException(status_code=404, detail="Vector store not found")
         
+        # Check quota before creating embedding
+        content_length = len(request.content)
+        await check_quota(vector_store_id, new_storage_bytes=content_length, new_embedding_count=1)
+        
         # Convert embedding to vector string format
         embedding_vector_str = "[" + ",".join(map(str, request.embedding)) + "]"
         
@@ -912,6 +1044,10 @@ async def create_embeddings_batch(
         
         if not request.embeddings:
             raise HTTPException(status_code=400, detail="No embeddings provided")
+        
+        # Check quota before batch creating embeddings
+        total_content_length = sum(len(emb.content) for emb in request.embeddings)
+        await check_quota(vector_store_id, new_storage_bytes=total_content_length, new_embedding_count=len(request.embeddings))
         
         # Prepare batch insert
         fields = settings.db_fields
@@ -1197,6 +1333,10 @@ async def ingest_files(
                 total_chunks=0,
                 total_embeddings=0
             )
+        
+        # Check quota before generating embeddings
+        total_content_length = sum(len(chunk) for chunk, _ in all_chunks)
+        await check_quota(vector_store_id, new_storage_bytes=total_content_length, new_embedding_count=len(all_chunks))
         
         # Generate embeddings in batches
         embed_start = time.time()
@@ -2323,6 +2463,17 @@ async def get_settings():
             "dimensions": eff.embedding.dimensions,
         },
         "db_fields": eff.db_fields.model_dump(),
+        "rate_limit": {
+            "enabled": eff.rate_limit.enabled,
+            "requests_per_minute": eff.rate_limit.requests_per_minute,
+            "requests_per_second": eff.rate_limit.requests_per_second,
+            "burst_size": eff.rate_limit.burst_size,
+        },
+        "quota": {
+            "enabled": eff.quota.enabled,
+            "max_storage_bytes": eff.quota.max_storage_bytes,
+            "max_embedding_count": eff.quota.max_embedding_count,
+        },
     }
 
 
@@ -2349,6 +2500,21 @@ async def get_settings_schema():
                     "vector_store_id_field": {"type": "string"},
                     "created_at_field": {"type": "string"}
                 }
+            },
+            "rate_limit": {
+                "fields": {
+                    "enabled": {"type": "boolean"},
+                    "requests_per_minute": {"type": "integer", "min": 1},
+                    "requests_per_second": {"type": "integer", "min": 1},
+                    "burst_size": {"type": "integer", "min": 1}
+                }
+            },
+            "quota": {
+                "fields": {
+                    "enabled": {"type": "boolean"},
+                    "max_storage_bytes": {"type": "integer", "min": 0},
+                    "max_embedding_count": {"type": "integer", "min": 0}
+                }
             }
         }
     }
@@ -2357,7 +2523,7 @@ async def get_settings_schema():
 @admin_router.put("/settings")
 async def update_settings(payload: dict):
     # Split payload into groups and upsert each as JSON into app_settings
-    groups = {k: v for k, v in payload.items() if k in {"server", "auth", "embedding", "db_fields", "cors"}}
+    groups = {k: v for k, v in payload.items() if k in {"server", "auth", "embedding", "db_fields", "cors", "rate_limit", "quota"}}
 
     if not groups:
         raise HTTPException(status_code=400, detail="No valid setting groups provided")
@@ -2406,6 +2572,50 @@ async def test_connectivity():
     if not emb_ok:
         result["embedding"]["error"] = emb_err
     return result
+
+
+@admin_router.get("/rate_limits", response_model=RateLimitResponse)
+async def get_rate_limits():
+    """Get current rate limit and quota configuration"""
+    eff = settings_manager.effective
+    return RateLimitResponse(
+        rate_limit=RateLimitConfigResponse(
+            enabled=eff.rate_limit.enabled,
+            requests_per_minute=eff.rate_limit.requests_per_minute,
+            requests_per_second=eff.rate_limit.requests_per_second,
+            burst_size=eff.rate_limit.burst_size,
+        ),
+        quota=QuotaConfigResponse(
+            enabled=eff.quota.enabled,
+            max_storage_bytes=eff.quota.max_storage_bytes,
+            max_embedding_count=eff.quota.max_embedding_count,
+        ),
+    )
+
+
+@admin_router.put("/rate_limits")
+async def update_rate_limits(payload: dict):
+    """Update rate limit and quota configuration"""
+    # Extract rate_limit and quota configs
+    rate_limit_data = payload.get("rate_limit", {})
+    quota_data = payload.get("quota", {})
+    
+    if not rate_limit_data and not quota_data:
+        raise HTTPException(status_code=400, detail="Must provide rate_limit or quota configuration")
+    
+    # Build settings payload
+    settings_payload = {}
+    
+    if rate_limit_data:
+        settings_payload["rate_limit"] = rate_limit_data
+    
+    if quota_data:
+        settings_payload["quota"] = quota_data
+    
+    # Use existing update_settings logic
+    await update_settings(settings_payload)
+    
+    return {"status": "ok", "message": "Rate limits and quotas updated successfully"}
 
 
 app.include_router(admin_router)

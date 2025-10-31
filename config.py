@@ -21,6 +21,21 @@ class EmbeddingConfig(BaseModel):
     dimensions: int = 1536
 
 
+class RateLimitConfig(BaseModel):
+    """Configuration for rate limiting"""
+    enabled: bool = True
+    requests_per_minute: int = 60  # Default: 60 requests per minute
+    requests_per_second: Optional[int] = None  # Optional: requests per second (overrides per_minute if set)
+    burst_size: int = 10  # Burst capacity for token bucket
+
+
+class QuotaConfig(BaseModel):
+    """Configuration for quotas per vector store"""
+    enabled: bool = True
+    max_storage_bytes: Optional[int] = None  # Maximum storage in bytes (None = unlimited)
+    max_embedding_count: Optional[int] = None  # Maximum number of embeddings (None = unlimited)
+
+
 class Settings(BaseSettings):
     """Application settings"""
     # Database configuration
@@ -38,6 +53,12 @@ class Settings(BaseSettings):
     
     # Embedding configuration
     embedding: EmbeddingConfig = EmbeddingConfig()
+    
+    # Rate limiting configuration
+    rate_limit: RateLimitConfig = RateLimitConfig()
+    
+    # Quota configuration
+    quota: QuotaConfig = QuotaConfig()
     
     class Config:
         env_file = ".env"
@@ -74,6 +95,8 @@ class AppSettingsOverlay(BaseModel):
     embedding: Optional[EmbeddingConfig] = None
     db_fields: Optional[DatabaseFieldConfig] = None
     cors: Optional[Dict[str, Any]] = None    # keys: allow_origins (list[str])
+    rate_limit: Optional[RateLimitConfig] = None
+    quota: Optional[QuotaConfig] = None
 
 
 def merge_settings_with_overlay(base: Settings, overlay: Optional[AppSettingsOverlay]) -> Settings:
@@ -113,6 +136,20 @@ def merge_settings_with_overlay(base: Settings, overlay: Optional[AppSettingsOve
         for field_name, value in overlay.db_fields.model_dump(exclude_none=True).items():
             setattr(dbf, field_name, value)
         merged.db_fields = dbf
+
+    # Rate limiting
+    if overlay.rate_limit:
+        rl = merged.rate_limit.model_copy(deep=True)
+        for field_name, value in overlay.rate_limit.model_dump(exclude_none=True).items():
+            setattr(rl, field_name, value)
+        merged.rate_limit = rl
+
+    # Quota
+    if overlay.quota:
+        q = merged.quota.model_copy(deep=True)
+        for field_name, value in overlay.quota.model_dump(exclude_none=True).items():
+            setattr(q, field_name, value)
+        merged.quota = q
 
     # CORS (if added later to Settings)
     # Placeholder: merged does not currently track CORS; handled in app wiring.
@@ -168,6 +205,16 @@ class SettingsManager:
                     continue
             elif key == "cors":
                 overlay.cors = val
+            elif key == "rate_limit":
+                try:
+                    overlay.rate_limit = RateLimitConfig(**val)
+                except Exception:
+                    continue
+            elif key == "quota":
+                try:
+                    overlay.quota = QuotaConfig(**val)
+                except Exception:
+                    continue
 
         await self.apply_overlay(overlay)
 

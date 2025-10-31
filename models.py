@@ -227,3 +227,39 @@ class FileIngestResponse(BaseModel):
     total_files: int
     total_chunks: int
     total_embeddings: int
+
+
+class RateLimitConfigRequest(BaseModel):
+    """Request model for rate limit configuration"""
+    enabled: bool = True
+    requests_per_minute: Optional[int] = None
+    requests_per_second: Optional[int] = None
+    burst_size: int = 10
+
+
+class RateLimitConfigResponse(BaseModel):
+    """Response model for rate limit configuration"""
+    enabled: bool
+    requests_per_minute: Optional[int] = None
+    requests_per_second: Optional[int] = None
+    burst_size: int
+
+
+class QuotaConfigRequest(BaseModel):
+    """Request model for quota configuration"""
+    enabled: bool = True
+    max_storage_bytes: Optional[int] = None
+    max_embedding_count: Optional[int] = None
+
+
+class QuotaConfigResponse(BaseModel):
+    """Response model for quota configuration"""
+    enabled: bool
+    max_storage_bytes: Optional[int] = None
+    max_embedding_count: Optional[int] = None
+
+
+class RateLimitResponse(BaseModel):
+    """Response model for rate limit information"""
+    rate_limit: RateLimitConfigResponse
+    quota: QuotaConfigResponse

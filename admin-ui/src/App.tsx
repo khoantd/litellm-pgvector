@@ -7,12 +7,32 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from './components/ui/tabs'
 import { Toaster, toast } from 'sonner'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from './components/ui/dialog'
 import { FileUploader } from './components/FileUploader'
+import {
+  EndpointBreakdownChart,
+  EndpointPieChart,
+  TopVectorStoresChart,
+  ResponseTimeChart,
+  ErrorRateChart,
+  MetricsComparison,
+  PeriodComparisonChart
+} from './components/AnalyticsCharts'
 
 type Settings = {
   server: { host: string; port: number }
   auth: { server_api_key: string | null }
   embedding: { model: string; base_url: string; api_key: string | null; dimensions: number }
   db_fields: Record<string, string>
+  rate_limit?: {
+    enabled: boolean
+    requests_per_minute?: number | null
+    requests_per_second?: number | null
+    burst_size: number
+  }
+  quota?: {
+    enabled: boolean
+    max_storage_bytes?: number | null
+    max_embedding_count?: number | null
+  }
 }
 
 type VectorStore = {
@@ -144,6 +164,14 @@ export function App() {
   const [globalStats, setGlobalStats] = useState<GlobalStats | null>(null)
   const [loadingStats, setLoadingStats] = useState(false)
   const [statsPeriod, setStatsPeriod] = useState<'daily' | 'weekly' | 'monthly' | 'all'>('daily')
+  // Period comparison state
+  const [comparisonStats, setComparisonStats] = useState<{
+    daily?: GlobalStats | VectorStoreStats
+    weekly?: GlobalStats | VectorStoreStats
+    monthly?: GlobalStats | VectorStoreStats
+    allTime?: GlobalStats | VectorStoreStats
+  }>({})
+  const [loadingComparison, setLoadingComparison] = useState(false)
   
   // Search Testing state
   const [searchQuery, setSearchQuery] = useState('')
@@ -342,6 +370,48 @@ export function App() {
       // Silently fail - stats might not be available
     }
   }
+
+  async function loadPeriodComparison(storeId?: string) {
+    setLoadingComparison(true)
+    try {
+      const periods: Array<'daily' | 'weekly' | 'monthly' | 'all'> = ['daily', 'weekly', 'monthly', 'all']
+      const promises = periods.map(async period => {
+        try {
+          if (storeId) {
+            const stats = await apiPublic<VectorStoreStats>(`/v1/vector_stores/${storeId}/stats?period=${period}`)
+            return { period, stats }
+          } else {
+            const stats = await apiPublic<GlobalStats>(`/v1/stats?period=${period}`)
+            return { period, stats }
+          }
+        } catch (e) {
+          return { period, stats: null }
+        }
+      })
+
+      const results = await Promise.all(promises)
+      const comparison: typeof comparisonStats = {}
+      results.forEach(({ period, stats }) => {
+        if (stats) {
+          if (period === 'daily') comparison.daily = stats
+          else if (period === 'weekly') comparison.weekly = stats
+          else if (period === 'monthly') comparison.monthly = stats
+          else if (period === 'all') comparison.allTime = stats
+        }
+      })
+      setComparisonStats(comparison)
+    } catch (e: any) {
+      // Silently fail
+    } finally {
+      setLoadingComparison(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!apiKey || activeTab !== 'analytics') return
+    // Load comparison data when analytics tab is active
+    loadPeriodComparison(selectedStore || undefined)
+  }, [apiKey, activeTab, selectedStore])
 
   async function performSearch() {
     if (!searchStoreId || !searchQuery.trim()) {
@@ -562,6 +632,161 @@ export function App() {
                     </div>
                   ))}
                 </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Rate Limiting</CardTitle>
+                </CardHeader>
+                <CardContent className="grid gap-3">
+                  <div className="grid gap-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="rl-enabled"
+                        checked={settings.rate_limit?.enabled ?? true}
+                        onChange={e => {
+                          if (!settings.rate_limit) {
+                            setSettings({ ...settings, rate_limit: { enabled: e.target.checked, burst_size: 10 } })
+                          } else {
+                            setField('rate_limit', 'enabled', e.target.checked)
+                          }
+                        }}
+                        className="rounded"
+                      />
+                      <Label htmlFor="rl-enabled">Enable Rate Limiting</Label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">Control request rate per API key.</p>
+                  </div>
+                  {settings.rate_limit?.enabled !== false && (
+                    <>
+                      <div className="grid gap-2">
+                        <Label htmlFor="rl-per-min">Requests per Minute</Label>
+                        <Input
+                          id="rl-per-min"
+                          type="number"
+                          min="1"
+                          value={settings.rate_limit?.requests_per_minute ?? 60}
+                          onChange={e => {
+                            const val = e.target.value ? Number(e.target.value) : null
+                            if (!settings.rate_limit) {
+                              setSettings({ ...settings, rate_limit: { enabled: true, requests_per_minute: val, burst_size: 10 } })
+                            } else {
+                              setField('rate_limit', 'requests_per_minute', val)
+                            }
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground">Maximum requests per minute per API key.</p>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="rl-per-sec">Requests per Second (optional)</Label>
+                        <Input
+                          id="rl-per-sec"
+                          type="number"
+                          min="1"
+                          placeholder="Leave empty to use per-minute"
+                          value={settings.rate_limit?.requests_per_second ?? ''}
+                          onChange={e => {
+                            const val = e.target.value ? Number(e.target.value) : null
+                            if (!settings.rate_limit) {
+                              setSettings({ ...settings, rate_limit: { enabled: true, requests_per_second: val, burst_size: 10 } })
+                            } else {
+                              setField('rate_limit', 'requests_per_second', val)
+                            }
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground">Override per-minute limit with per-second limit.</p>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="rl-burst">Burst Size</Label>
+                        <Input
+                          id="rl-burst"
+                          type="number"
+                          min="1"
+                          value={settings.rate_limit?.burst_size ?? 10}
+                          onChange={e => {
+                            const val = Number(e.target.value)
+                            if (!settings.rate_limit) {
+                              setSettings({ ...settings, rate_limit: { enabled: true, burst_size: val } })
+                            } else {
+                              setField('rate_limit', 'burst_size', val)
+                            }
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground">Maximum burst capacity for token bucket algorithm.</p>
+                      </div>
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Quotas</CardTitle>
+                </CardHeader>
+                <CardContent className="grid gap-3">
+                  <div className="grid gap-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="quota-enabled"
+                        checked={settings.quota?.enabled ?? true}
+                        onChange={e => {
+                          if (!settings.quota) {
+                            setSettings({ ...settings, quota: { enabled: e.target.checked } })
+                          } else {
+                            setField('quota', 'enabled', e.target.checked)
+                          }
+                        }}
+                        className="rounded"
+                      />
+                      <Label htmlFor="quota-enabled">Enable Quotas</Label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">Enforce storage and embedding count limits per vector store.</p>
+                  </div>
+                  {settings.quota?.enabled !== false && (
+                    <>
+                      <div className="grid gap-2">
+                        <Label htmlFor="quota-storage">Max Storage (bytes)</Label>
+                        <Input
+                          id="quota-storage"
+                          type="number"
+                          min="0"
+                          placeholder="Leave empty for unlimited"
+                          value={settings.quota?.max_storage_bytes ?? ''}
+                          onChange={e => {
+                            const val = e.target.value ? Number(e.target.value) : null
+                            if (!settings.quota) {
+                              setSettings({ ...settings, quota: { enabled: true, max_storage_bytes: val } })
+                            } else {
+                              setField('quota', 'max_storage_bytes', val)
+                            }
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground">Maximum storage bytes per vector store (429 if exceeded).</p>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="quota-count">Max Embedding Count</Label>
+                        <Input
+                          id="quota-count"
+                          type="number"
+                          min="0"
+                          placeholder="Leave empty for unlimited"
+                          value={settings.quota?.max_embedding_count ?? ''}
+                          onChange={e => {
+                            const val = e.target.value ? Number(e.target.value) : null
+                            if (!settings.quota) {
+                              setSettings({ ...settings, quota: { enabled: true, max_embedding_count: val } })
+                            } else {
+                              setField('quota', 'max_embedding_count', val)
+                            }
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground">Maximum number of embeddings per vector store (429 if exceeded).</p>
+                      </div>
+                    </>
+                  )}
+                </CardContent>
                 <CardFooter className="justify-end">
                   <Button onClick={save} disabled={saving || validationErrors.port || validationErrors.dimensions}>{saving ? 'Saving...' : 'Save changes'}</Button>
                 </CardFooter>
@@ -727,8 +952,12 @@ export function App() {
                       <option key={store.id} value={store.id}>{store.name}</option>
                     ))}
                   </select>
-                  <Button variant="outline" onClick={() => { loadGlobalStats(); if (selectedStore) loadVectorStoreStats(selectedStore) }} disabled={loadingStats}>
-                    {loadingStats ? 'Loading...' : 'Refresh'}
+                  <Button variant="outline" onClick={() => { 
+                    loadGlobalStats()
+                    if (selectedStore) loadVectorStoreStats(selectedStore)
+                    loadPeriodComparison(selectedStore || undefined)
+                  }} disabled={loadingStats || loadingComparison}>
+                    {loadingStats || loadingComparison ? 'Loading...' : 'Refresh'}
                   </Button>
                 </div>
               </CardHeader>
@@ -737,6 +966,22 @@ export function App() {
                   <div className="text-center py-8 text-muted-foreground">Loading analytics...</div>
                 ) : (
                   <>
+                    {(Object.keys(comparisonStats).length > 0) && (
+                      <Card>
+                        <CardHeader>
+                          <CardTitle>Period Comparison</CardTitle>
+                        </CardHeader>
+                        <CardContent className="pt-6">
+                          <PeriodComparisonChart
+                            daily={comparisonStats.daily as any}
+                            weekly={comparisonStats.weekly as any}
+                            monthly={comparisonStats.monthly as any}
+                            allTime={comparisonStats.allTime as any}
+                          />
+                        </CardContent>
+                      </Card>
+                    )}
+                    
                     <div>
                       <h3 className="text-lg font-semibold mb-4">Global Statistics</h3>
                       {globalStats ? (
@@ -815,79 +1060,182 @@ export function App() {
                       </div>
                     )}
 
-                    {globalStats?.endpoint_stats && (
+                    <div className="space-y-6">
                       <div>
                         <h3 className="text-lg font-semibold mb-4">Endpoint Breakdown</h3>
-                        <div className="space-y-2">
-                          {Object.entries(globalStats.endpoint_stats).map(([endpoint, stats]) => (
-                            <div key={endpoint} className="p-4 border rounded-lg">
-                              <div className="font-medium mb-2">{endpoint}</div>
-                              <div className="grid grid-cols-3 gap-4 text-sm">
-                                <div>
-                                  <span className="text-muted-foreground">Requests: </span>
-                                  <span className="font-medium">{stats.count}</span>
-                                </div>
-                                <div>
-                                  <span className="text-muted-foreground">Avg Time: </span>
-                                  <span className="font-medium">{stats.avg_response_time_ms.toFixed(1)} ms</span>
-                                </div>
-                                <div>
-                                  <span className="text-muted-foreground">Errors: </span>
-                                  <span className="font-medium">{stats.error_count}</span>
-                                </div>
+                        {globalStats?.endpoint_stats ? (
+                          <>
+                            <Card>
+                              <CardContent className="pt-6">
+                                <EndpointBreakdownChart endpointStats={globalStats.endpoint_stats} />
+                              </CardContent>
+                            </Card>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+                              <Card>
+                                <CardContent className="pt-6">
+                                  <EndpointPieChart endpointStats={globalStats.endpoint_stats} title="Request Distribution" />
+                                </CardContent>
+                              </Card>
+                              <Card>
+                                <CardContent className="pt-6">
+                                  <ResponseTimeChart endpointStats={globalStats.endpoint_stats} title="Response Times by Endpoint" />
+                                </CardContent>
+                              </Card>
+                            </div>
+                            <Card className="mt-6">
+                              <CardContent className="pt-6">
+                                <ErrorRateChart endpointStats={globalStats.endpoint_stats} title="Error Rates by Endpoint" />
+                              </CardContent>
+                            </Card>
+                            <div className="mt-6">
+                              <h3 className="text-lg font-semibold mb-4">Endpoint Details</h3>
+                              <div className="space-y-2">
+                                {Object.entries(globalStats.endpoint_stats).map(([endpoint, stats]) => (
+                                  <div key={endpoint} className="p-4 border rounded-lg">
+                                    <div className="font-medium mb-2">{endpoint}</div>
+                                    <div className="grid grid-cols-3 gap-4 text-sm">
+                                      <div>
+                                        <span className="text-muted-foreground">Requests: </span>
+                                        <span className="font-medium">{stats.count}</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-muted-foreground">Avg Time: </span>
+                                        <span className="font-medium">{stats.avg_response_time_ms.toFixed(1)} ms</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-muted-foreground">Errors: </span>
+                                        <span className="font-medium">{stats.error_count}</span>
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
                               </div>
                             </div>
-                          ))}
-                        </div>
+                          </>
+                        ) : (
+                          <Card>
+                            <CardContent className="pt-6">
+                              <div className="h-64 flex items-center justify-center text-muted-foreground border rounded-lg">
+                                <div className="text-center">
+                                  <p className="text-sm">No endpoint statistics available</p>
+                                  <p className="text-xs mt-2">Make API requests to see endpoint breakdown charts</p>
+                                </div>
+                              </div>
+                            </CardContent>
+                          </Card>
+                        )}
                       </div>
-                    )}
+                    </div>
 
-                    {globalStats?.top_vector_stores && (
+                    <div className="space-y-6">
                       <div>
                         <h3 className="text-lg font-semibold mb-4">Top Vector Stores</h3>
-                        <div className="space-y-2">
-                          {globalStats.top_vector_stores.map((item, idx) => (
-                            <div key={item.vector_store_id} className="p-4 border rounded-lg flex items-center justify-between">
-                              <div className="min-w-0">
-                                <div className="font-medium">{vectorStores.find(v => v.id === item.vector_store_id)?.name || item.vector_store_id}</div>
-                                <div className="text-sm text-muted-foreground">Requests: {item.request_count} • Avg {item.avg_response_time_ms.toFixed(1)} ms</div>
+                        {globalStats?.top_vector_stores && globalStats.top_vector_stores.length > 0 ? (
+                          <>
+                            <Card>
+                              <CardContent className="pt-6">
+                                <TopVectorStoresChart
+                                  topStores={globalStats.top_vector_stores}
+                                  storeNames={Object.fromEntries(vectorStores.map(v => [v.id, v.name]))}
+                                />
+                              </CardContent>
+                            </Card>
+                            <div className="mt-6">
+                              <h3 className="text-lg font-semibold mb-4">Top Stores Details</h3>
+                              <div className="space-y-2">
+                                {globalStats.top_vector_stores.map((item, idx) => (
+                                  <div key={item.vector_store_id} className="p-4 border rounded-lg flex items-center justify-between">
+                                    <div className="min-w-0">
+                                      <div className="font-medium">{vectorStores.find(v => v.id === item.vector_store_id)?.name || item.vector_store_id}</div>
+                                      <div className="text-sm text-muted-foreground">Requests: {item.request_count} • Avg {item.avg_response_time_ms.toFixed(1)} ms</div>
+                                    </div>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={() => setSelectedStore(item.vector_store_id)}
+                                    >
+                                      View
+                                    </Button>
+                                  </div>
+                                ))}
                               </div>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setSelectedStore(item.vector_store_id)}
-                              >
-                                View
-                              </Button>
                             </div>
-                          ))}
-                        </div>
+                          </>
+                        ) : (
+                          <Card>
+                            <CardContent className="pt-6">
+                              <div className="h-64 flex items-center justify-center text-muted-foreground border rounded-lg">
+                                <div className="text-center">
+                                  <p className="text-sm">No top vector stores data available</p>
+                                  <p className="text-xs mt-2">Make API requests to see top stores chart</p>
+                                </div>
+                              </div>
+                            </CardContent>
+                          </Card>
+                        )}
                       </div>
-                    )}
+                    </div>
 
-                    {selectedStore && vectorStoreStats?.endpoint_stats && (
-                      <div>
-                        <h3 className="text-lg font-semibold mb-4">Endpoint Breakdown (Selected Store)</h3>
-                        <div className="space-y-2">
-                          {Object.entries(vectorStoreStats.endpoint_stats).map(([endpoint, stats]) => (
-                            <div key={endpoint} className="p-4 border rounded-lg">
-                              <div className="font-medium mb-2">{endpoint}</div>
-                              <div className="grid grid-cols-3 gap-4 text-sm">
-                                <div>
-                                  <span className="text-muted-foreground">Requests: </span>
-                                  <span className="font-medium">{stats.count}</span>
-                                </div>
-                                <div>
-                                  <span className="text-muted-foreground">Avg Time: </span>
-                                  <span className="font-medium">{stats.avg_response_time_ms.toFixed(1)} ms</span>
-                                </div>
-                                <div>
-                                  <span className="text-muted-foreground">Errors: </span>
-                                  <span className="font-medium">{stats.error_count}</span>
+                    {selectedStore && (
+                      <div className="space-y-6">
+                        <div>
+                          <h3 className="text-lg font-semibold mb-4">Endpoint Breakdown (Selected Store)</h3>
+                          {vectorStoreStats?.endpoint_stats ? (
+                            <>
+                              <Card>
+                                <CardContent className="pt-6">
+                                  <EndpointBreakdownChart endpointStats={vectorStoreStats.endpoint_stats} />
+                                </CardContent>
+                              </Card>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+                                <Card>
+                                  <CardContent className="pt-6">
+                                    <ResponseTimeChart endpointStats={vectorStoreStats.endpoint_stats} title="Response Times by Endpoint" />
+                                  </CardContent>
+                                </Card>
+                                <Card>
+                                  <CardContent className="pt-6">
+                                    <ErrorRateChart endpointStats={vectorStoreStats.endpoint_stats} title="Error Rates by Endpoint" />
+                                  </CardContent>
+                                </Card>
+                              </div>
+                              <div className="mt-6">
+                                <h3 className="text-lg font-semibold mb-4">Endpoint Details</h3>
+                                <div className="space-y-2">
+                                  {Object.entries(vectorStoreStats.endpoint_stats).map(([endpoint, stats]) => (
+                                    <div key={endpoint} className="p-4 border rounded-lg">
+                                      <div className="font-medium mb-2">{endpoint}</div>
+                                      <div className="grid grid-cols-3 gap-4 text-sm">
+                                        <div>
+                                          <span className="text-muted-foreground">Requests: </span>
+                                          <span className="font-medium">{stats.count}</span>
+                                        </div>
+                                        <div>
+                                          <span className="text-muted-foreground">Avg Time: </span>
+                                          <span className="font-medium">{stats.avg_response_time_ms.toFixed(1)} ms</span>
+                                        </div>
+                                        <div>
+                                          <span className="text-muted-foreground">Errors: </span>
+                                          <span className="font-medium">{stats.error_count}</span>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  ))}
                                 </div>
                               </div>
-                            </div>
-                          ))}
+                            </>
+                          ) : (
+                            <Card>
+                              <CardContent className="pt-6">
+                                <div className="h-64 flex items-center justify-center text-muted-foreground border rounded-lg">
+                                  <div className="text-center">
+                                    <p className="text-sm">No endpoint statistics for this store</p>
+                                    <p className="text-xs mt-2">Make API requests to this vector store to see charts</p>
+                                  </div>
+                                </div>
+                              </CardContent>
+                            </Card>
+                          )}
                         </div>
                       </div>
                     )}
