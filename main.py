@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, F
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from prisma import Prisma
 from dotenv import load_dotenv
 import anyio
@@ -2414,3 +2415,8 @@ app.include_router(admin_router)
 @app.get("/v1/openapi.json")
 async def openapi_alias():
     return app.openapi()
+
+# Optional compatibility alias for docs under versioned path
+@app.get("/v1/docs", include_in_schema=False)
+async def docs_alias():
+    return RedirectResponse(url="/docs")
