@@ -47,3 +47,19 @@ model AppSetting {
 
   @@map("app_settings")
 }
+
+model UsageLog {
+  id              String    @id @default(cuid())
+  vector_store_id String?
+  endpoint        String    // e.g., "search", "create_embedding", "delete_embedding"
+  method          String    // e.g., "POST", "GET", "DELETE"
+  response_time_ms Int       // Response time in milliseconds
+  status_code     Int       // HTTP status code
+  created_at      DateTime  @default(now())
+  
+  // Indexes for efficient querying
+  @@index([vector_store_id, created_at])
+  @@index([endpoint, created_at])
+  @@index([created_at])
+  @@map("usage_logs")
+}

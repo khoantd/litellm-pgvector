@@ -30,6 +30,9 @@ class VectorStoreSearchRequest(BaseModel):
     limit: Optional[int] = 20
     filters: Optional[Dict[str, Any]] = None
     return_metadata: Optional[bool] = True
+    search_mode: Optional[str] = "hybrid"  # Options: "vector_only", "keyword_only", "hybrid"
+    vector_weight: Optional[float] = 0.7  # Weight for vector similarity (0.0-1.0)
+    keyword_weight: Optional[float] = 0.3  # Weight for keyword relevance (0.0-1.0)
 
 
 class ContentChunk(BaseModel):
@@ -84,3 +87,95 @@ class VectorStoreListResponse(BaseModel):
     first_id: Optional[str] = None
     last_id: Optional[str] = None
     has_more: bool = False
+
+
+class EmbeddingUpdateRequest(BaseModel):
+    """Request model for PUT (full update) of an embedding"""
+    content: Optional[str] = None
+    embedding: Optional[List[float]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class EmbeddingPatchRequest(BaseModel):
+    """Request model for PATCH (partial update) of an embedding"""
+    content: Optional[str] = None
+    embedding: Optional[List[float]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class EmbeddingBatchDeleteRequest(BaseModel):
+    """Request model for batch deletion of embeddings"""
+    embedding_ids: Optional[List[str]] = None
+    filters: Optional[Dict[str, Any]] = None
+
+
+class EmbeddingDeleteResponse(BaseModel):
+    """Response model for embedding deletion"""
+    object: str = "embedding.deleted"
+    id: str
+    deleted: bool = True
+
+
+class EmbeddingBatchDeleteResponse(BaseModel):
+    """Response model for batch deletion"""
+    object: str = "embedding.batch_deleted"
+    deleted_ids: List[str]
+    deleted_count: int
+
+
+class VectorStoreDeleteRequest(BaseModel):
+    """Request model for vector store deletion"""
+    cascade: bool = True  # Whether to cascade delete embeddings
+
+
+class VectorStoreDeleteResponse(BaseModel):
+    """Response model for vector store deletion"""
+    object: str = "vector_store.deleted"
+    id: str
+    deleted: bool = True
+    embeddings_deleted_count: Optional[int] = None
+
+
+class VectorStoreStatsResponse(BaseModel):
+    """Response model for vector store statistics"""
+    object: str = "vector_store.stats"
+    vector_store_id: str
+    period: str  # "daily", "weekly", "monthly", "all"
+    start_time: Optional[int] = None  # Unix timestamp
+    end_time: Optional[int] = None  # Unix timestamp
+    
+    # Metrics
+    total_requests: int = 0
+    search_queries: int = 0
+    embeddings_created: int = 0
+    embeddings_deleted: int = 0
+    storage_bytes: int = 0
+    avg_response_time_ms: float = 0.0
+    error_count: int = 0
+    error_rate: float = 0.0
+    
+    # Breakdown by endpoint
+    endpoint_stats: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+class GlobalStatsResponse(BaseModel):
+    """Response model for global statistics"""
+    object: str = "stats.global"
+    period: str  # "daily", "weekly", "monthly", "all"
+    start_time: Optional[int] = None
+    end_time: Optional[int] = None
+    
+    # Global metrics
+    total_requests: int = 0
+    total_vector_stores: int = 0
+    total_embeddings: int = 0
+    total_storage_bytes: int = 0
+    avg_response_time_ms: float = 0.0
+    error_count: int = 0
+    error_rate: float = 0.0
+    
+    # Breakdown by endpoint
+    endpoint_stats: Optional[Dict[str, Dict[str, Any]]] = None
+    
+    # Breakdown by vector store (top N)
+    top_vector_stores: Optional[List[Dict[str, Any]]] = None
