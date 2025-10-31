@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -69,6 +69,23 @@ class EmbeddingResponse(BaseModel):
     content: str
     metadata: Optional[Dict[str, Any]] = None
     created_at: int
+
+
+class EmbeddingListItem(BaseModel):
+    """List item model for embeddings listing"""
+    id: str
+    vector_store_id: str
+    content: str
+    metadata: Optional[Dict[str, Any]] = None
+    created_at: int
+
+
+class EmbeddingListResponse(BaseModel):
+    """Response model for listing embeddings"""
+    object: str = "list"
+    data: List[EmbeddingListItem]
+    last_id: Optional[str] = None
+    has_more: bool = False
 
 
 class EmbeddingBatchCreateRequest(BaseModel):
@@ -179,3 +196,34 @@ class GlobalStatsResponse(BaseModel):
     
     # Breakdown by vector store (top N)
     top_vector_stores: Optional[List[Dict[str, Any]]] = None
+
+
+class FileIngestOptions(BaseModel):
+    """Options for file ingestion and chunking"""
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    splitter: Literal["tokens", "chars", "lines", "paragraphs"] = "chars"
+    max_chunks: Optional[int] = None
+    delimiter: str = "\n"  # For CSV/XLSX row concatenation
+    sheet: Optional[str] = None  # For XLSX sheet selection
+    normalize_whitespace: bool = True
+    lowercase: bool = False
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class FileIngestResult(BaseModel):
+    """Result for a single file ingestion"""
+    file_name: str
+    num_chunks: int
+    num_embeddings: int
+    metadata: Optional[Dict[str, Any]] = None
+    warnings: List[str] = []
+
+
+class FileIngestResponse(BaseModel):
+    """Response model for file ingestion"""
+    object: str = "file.ingest"
+    results: List[FileIngestResult]
+    total_files: int
+    total_chunks: int
+    total_embeddings: int

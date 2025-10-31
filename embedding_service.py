@@ -65,16 +65,23 @@ class EmbeddingService:
                 api_key=self.config.api_key
             )
             
-            # Extract embeddings from response
-            embeddings = [item.embedding for item in response.data]
-            
-            # Validate embedding dimensions
-            for i, embedding in enumerate(embeddings):
+            # Extract embeddings from response (handle dict or object items)
+            embeddings: List[List[float]] = []
+            for idx, item in enumerate(response.data):
+                if isinstance(item, dict):
+                    embedding = item.get("embedding")
+                else:
+                    embedding = getattr(item, "embedding", None)
+                if embedding is None:
+                    raise ValueError(f"Embedding missing at index {idx} in response.data")
+                if not isinstance(embedding, list):
+                    raise ValueError(f"Embedding at index {idx} is not a list; got {type(embedding).__name__}")
                 if len(embedding) != self.config.dimensions:
                     raise ValueError(
-                        f"Expected embedding dimension {self.config.dimensions} for text {i}, "
+                        f"Expected embedding dimension {self.config.dimensions} for text {idx}, "
                         f"got {len(embedding)}"
                     )
+                embeddings.append(embedding)
             
             return embeddings
             

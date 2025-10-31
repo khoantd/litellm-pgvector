@@ -1,13 +1,16 @@
 import os
 import asyncio
 import time
+import json
+import logging
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from prisma import Prisma
 from dotenv import load_dotenv
+import anyio
 
 from models import (
     VectorStoreCreateRequest,
@@ -29,17 +32,27 @@ from models import (
     VectorStoreDeleteRequest,
     VectorStoreDeleteResponse,
     VectorStoreStatsResponse,
-    GlobalStatsResponse
+    GlobalStatsResponse,
+    FileIngestOptions,
+    FileIngestResponse,
+    FileIngestResult,
+    EmbeddingListResponse,
+    EmbeddingListItem
 )
 from config import settings, settings_manager
 from embedding_service import embedding_service
+from ingestion.text_extractors import extract_text_from_upload, ExtractedPart
+from ingestion.chunking import chunk_text
 
 load_dotenv()
 
 app = FastAPI(
     title="OpenAI Vector Stores API",
     description="OpenAI-compatible Vector Stores API using PGVector",
-    version="1.0.0"
+    version="1.0.0",
+    openapi_url="/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 # CORS middleware
@@ -60,6 +73,9 @@ except Exception:
 
 # Global Prisma client
 db = Prisma()
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
 def _on_settings_applied(old, new):
@@ -262,12 +278,11 @@ async def update_vector_store_stats_on_delete(
         f"""
         UPDATE {vector_store_table} 
         SET file_counts = jsonb_set(
-                COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
-                '{{completed}}',
-                GREATEST((COALESCE(file_counts->>'completed', '0')::int - $2), 0)::text::jsonb
-            ),
-            file_counts = jsonb_set(
-                file_counts,
+                jsonb_set(
+                    COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
+                    '{{completed}}',
+                    GREATEST((COALESCE(file_counts->>'completed', '0')::int - $2), 0)::text::jsonb
+                ),
                 '{{total}}',
                 GREATEST((COALESCE(file_counts->>'total', '0')::int - $2), 0)::text::jsonb
             ),
@@ -450,12 +465,35 @@ async def list_vector_stores(
         if has_more:
             results = results[:limit]  # Remove extra result
         
+        # Helper to robustly convert timestamps to epoch seconds
+        def to_int_timestamp(val):
+            if val is None:
+                return None
+            try:
+                # If already a number-like
+                if isinstance(val, (int, float)):
+                    return int(val)
+                # Datetime-like with timestamp()
+                ts_attr = getattr(val, "timestamp", None)
+                if callable(ts_attr):
+                    return int(val.timestamp())
+                # ISO string
+                if isinstance(val, str):
+                    from datetime import datetime
+                    try:
+                        return int(datetime.fromisoformat(val).timestamp())
+                    except Exception:
+                        return None
+            except Exception:
+                return None
+            return None
+
         # Convert to response format
         vector_stores = []
         for row in results:
-            created_at = int(row["created_at_timestamp"])
-            expires_at = int(row["expires_at"].timestamp()) if row.get("expires_at") else None
-            last_active_at = int(row["last_active_at"].timestamp()) if row.get("last_active_at") else None
+            created_at = to_int_timestamp(row.get("created_at_timestamp")) or 0
+            expires_at = to_int_timestamp(row.get("expires_at"))
+            last_active_at = to_int_timestamp(row.get("last_active_at"))
             
             vector_store = VectorStoreResponse(
                 id=row["id"],
@@ -489,7 +527,7 @@ async def list_vector_stores(
 
 
 @app.post("/v1/vector_stores/{vector_store_id}/search", response_model=VectorStoreSearchResponse)
-@app.post("/vector_stores/{vector_store_id}/search", response_model=VectorStoreSearchResponse)
+# @app.post("/vector_stores/{vector_store_id}/search", response_model=VectorStoreSearchResponse)
 async def search_vector_store(
     vector_store_id: str,
     request: VectorStoreSearchRequest,
@@ -509,6 +547,9 @@ async def search_vector_store(
                 status_code=400,
                 detail=f"Invalid search_mode: {search_mode}. Must be 'vector_only', 'keyword_only', or 'hybrid'"
             )
+        # Validate query string
+        if not isinstance(request.query, str) or not request.query.strip():
+            raise HTTPException(status_code=400, detail="query must be a non-empty string")
         
         # Validate and normalize weights
         vector_weight = request.vector_weight or 0.7
@@ -552,7 +593,27 @@ async def search_vector_store(
         # Build query based on search mode
         if search_mode == "vector_only" or search_mode == "hybrid":
             # Generate embedding for query
-            query_embedding = await generate_query_embedding(request.query)
+            try:
+                query_embedding = await generate_query_embedding(request.query)
+            except Exception as e:
+                # Surface provider/config errors clearly
+                raise HTTPException(status_code=502, detail=f"Embedding provider error: {str(e)}")
+
+            # Validate dimensions defensively (provider may change dims)
+            try:
+                expected_dims = settings.embedding.dimensions
+            except Exception:
+                expected_dims = None
+            if expected_dims is not None and isinstance(query_embedding, list):
+                if len(query_embedding) != expected_dims:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Query embedding dimension mismatch. Expected {expected_dims}, "
+                            f"got {len(query_embedding)}. Ensure model and DB schema are aligned."
+                        )
+                    )
+
             query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
             query_params.append(query_vector_str)
             
@@ -565,6 +626,9 @@ async def search_vector_store(
                 f"ELSE 0.0 END as vector_score"
             )
             param_count += 1
+        else:
+            # Ensure alias exists even when not used in this mode
+            select_parts.append("0.0 as vector_score")
         
         if search_mode == "keyword_only" or search_mode == "hybrid":
             # Prepare query text for full-text search (plainto_tsquery for phrase search)
@@ -573,12 +637,14 @@ async def search_vector_store(
             # Keyword relevance score using ts_rank_cd
             # ts_rank_cd returns values typically in 0-1 range, but can exceed 1.0
             # We cap at 1.0 for consistency with vector scores
+            # Compute tsvector inline to avoid dependency on a generated column existing
             select_parts.append(
-                f"CASE WHEN content_tsvector IS NOT NULL "
-                f"THEN LEAST(1.0, ts_rank_cd(content_tsvector, plainto_tsquery('english', ${param_count}))) "
-                f"ELSE 0.0 END as keyword_score"
+                f"LEAST(1.0, ts_rank_cd(to_tsvector('english', {fields.content_field}), plainto_tsquery('english', ${param_count}))) as keyword_score"
             )
             param_count += 1
+        else:
+            # Ensure alias exists even when not used in this mode
+            select_parts.append("0.0 as keyword_score")
         
         # Build WHERE clause
         query_params.append(vector_store_id)
@@ -596,27 +662,67 @@ async def search_vector_store(
                 where_clause += " AND " + " AND ".join(filter_conditions)
         
         # Build final score calculation for hybrid mode
+        # Use a subquery to compute vector_score and keyword_score, then compute final_score in the outer query.
         if search_mode == "hybrid":
-            select_parts.append(
-                f"((vector_score * {vector_weight}) + (keyword_score * {keyword_weight})) as final_score"
-            )
+            inner_select = ", ".join(select_parts)  # includes id, content, metadata, vector_score, keyword_score
+            inner_query = f"""
+            SELECT {inner_select}
+            FROM {table_name}
+            {where_clause}
+            """
             order_by = "ORDER BY final_score DESC"
-        elif search_mode == "vector_only":
-            order_by = "ORDER BY vector_score DESC"
-        else:  # keyword_only
-            order_by = "ORDER BY keyword_score DESC"
-        
-        # Build complete query
-        base_query = f"""
-        SELECT {", ".join(select_parts)}
-        FROM {table_name}
-        {where_clause}
-        {order_by}
-        LIMIT {limit}
-        """
+            base_query = f"""
+            SELECT {fields.id_field}, {fields.content_field}, {fields.metadata_field},
+                   ((vector_score * {vector_weight}) + (keyword_score * {keyword_weight})) as final_score
+            FROM ({inner_query}) AS scored_results
+            {order_by}
+            LIMIT {limit}
+            """
+        else:
+            # For vector_only or keyword_only, we can use direct ORDER BY on the alias
+            select_clause = ", ".join(select_parts)
+            if search_mode == "vector_only":
+                order_by = "ORDER BY vector_score DESC"
+            else:  # keyword_only
+                order_by = "ORDER BY keyword_score DESC"
+            
+            # Validate that required score columns are in the SELECT
+            if search_mode == "vector_only" and "vector_score" not in select_clause:
+                raise HTTPException(status_code=500, detail="Internal error: vector_score not found in SELECT clause")
+            if search_mode == "keyword_only" and "keyword_score" not in select_clause:
+                raise HTTPException(status_code=500, detail="Internal error: keyword_score not found in SELECT clause")
+            
+            base_query = f"""
+            SELECT {select_clause}
+            FROM {table_name}
+            {where_clause}
+            {order_by}
+            LIMIT {limit}
+            """
         
         # Execute the query
-        results = await db.query_raw(base_query, *query_params)
+        try:
+            results = await db.query_raw(base_query, *query_params)
+        except Exception as e:
+            msg = str(e)
+            # Catch pgvector dimension mismatch and return actionable error
+            if "dimension" in msg.lower() or "different dimensions" in msg.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Embedding dimension mismatch between query and stored vectors. "
+                        "Verify settings.embedding.dimensions matches the pgvector column and the provider model."
+                    )
+                )
+            # Catch column not found errors and provide better diagnostics
+            if "does not exist" in msg.lower() or "column" in msg.lower() and "score" in msg.lower():
+                logger.error(f"SQL query error - Search mode: {search_mode}, Select parts: {select_parts}")
+                logger.error(f"Query preview: {base_query[:500]}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"SQL query construction error: {msg}. This indicates an internal bug in query building."
+                )
+            raise
         
         # Convert results to SearchResult objects
         search_results = []
@@ -734,12 +840,11 @@ async def create_embedding(
             f"""
             UPDATE {vector_store_table} 
             SET file_counts = jsonb_set(
-                    COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
-                    '{{completed}}',
-                    (COALESCE(file_counts->>'completed', '0')::int + 1)::text::jsonb
-                ),
-                file_counts = jsonb_set(
-                    file_counts,
+                    jsonb_set(
+                        COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
+                        '{{completed}}',
+                        (COALESCE(file_counts->>'completed', '0')::int + 1)::text::jsonb
+                    ),
                     '{{total}}',
                     (COALESCE(file_counts->>'total', '0')::int + 1)::text::jsonb
                 ),
@@ -852,12 +957,11 @@ async def create_embeddings_batch(
             f"""
             UPDATE {vector_store_table} 
             SET file_counts = jsonb_set(
-                    COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
-                    '{{completed}}',
-                    (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
-                ),
-                file_counts = jsonb_set(
-                    file_counts,
+                    jsonb_set(
+                        COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
+                        '{{completed}}',
+                        (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
+                    ),
                     '{{total}}',
                     (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
                 ),
@@ -892,6 +996,406 @@ async def create_embeddings_batch(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to create embeddings batch: {str(e)}")
+
+
+@app.post("/v1/vector_stores/{vector_store_id}/files", response_model=FileIngestResponse)
+async def ingest_files(
+    vector_store_id: str,
+    files: List[UploadFile] = File(...),
+    options: str = Form(None),
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Ingest files and create embeddings from them.
+    Supports PDF, DOCX, TXT, CSV, and XLSX files.
+    """
+    start_time = time.time()
+    status_code = 200
+    extract_start = time.time()
+    
+    try:
+        # Check if vector store exists
+        vector_store_table = settings.table_names["vector_stores"]
+        vector_store_result = await db.query_raw(
+            f"SELECT id FROM {vector_store_table} WHERE id = $1",
+            vector_store_id
+        )
+        if not vector_store_result:
+            raise HTTPException(status_code=404, detail="Vector store not found")
+        
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided")
+        
+        # Parse options
+        ingest_options = FileIngestOptions()
+        if options:
+            try:
+                options_dict = json.loads(options)
+                ingest_options = FileIngestOptions(**options_dict)
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Invalid options JSON")
+        
+        # Validate and cap max_chunks
+        if ingest_options.max_chunks and ingest_options.max_chunks <= 0:
+            ingest_options.max_chunks = None
+        
+        # Default max file size: 25 MB
+        max_file_size = 25 * 1024 * 1024
+        
+        # Process files
+        results = []
+        all_chunks = []
+        total_content_length = 0
+        
+        for file in files:
+            file_result = None
+            file_warnings = []
+            
+            try:
+                # Validate file size
+                file_size = 0
+                content = await file.read()
+                file_size = len(content)
+                
+                if file_size > max_file_size:
+                    file_warnings.append(f"File size ({file_size} bytes) exceeds maximum ({max_file_size} bytes)")
+                    results.append(FileIngestResult(
+                        file_name=file.filename or "unknown",
+                        num_chunks=0,
+                        num_embeddings=0,
+                        warnings=file_warnings
+                    ))
+                    continue
+                
+                if file_size == 0:
+                    file_warnings.append("File is empty")
+                    results.append(FileIngestResult(
+                        file_name=file.filename or "unknown",
+                        num_chunks=0,
+                        num_embeddings=0,
+                        warnings=file_warnings
+                    ))
+                    continue
+                
+                # Reset file position for extraction
+                await file.seek(0)
+                
+                # Extract text from file
+                extract_start_file = time.time()
+                parts = await extract_text_from_upload(
+                    file,
+                    delimiter=ingest_options.delimiter,
+                    sheet=ingest_options.sheet
+                )
+                extract_time_file = time.time() - extract_start_file
+                logger.debug(f"Extracted text from {file.filename} in {extract_time_file:.2f}s, got {len(parts)} parts")
+                
+                if not parts:
+                    file_warnings.append("No text could be extracted from file")
+                    results.append(FileIngestResult(
+                        file_name=file.filename or "unknown",
+                        num_chunks=0,
+                        num_embeddings=0,
+                        warnings=file_warnings
+                    ))
+                    continue
+                
+                # Chunk extracted text
+                chunk_start_file = time.time()
+                file_chunks = []
+                for part_idx, part in enumerate(parts):
+                    # Normalize text
+                    text = part.text
+                    if ingest_options.normalize_whitespace:
+                        import re
+                        text = re.sub(r'\s+', ' ', text.strip())
+                    
+                    # Chunk the text
+                    chunks = chunk_text(
+                        text=text,
+                        chunk_size=ingest_options.chunk_size,
+                        chunk_overlap=ingest_options.chunk_overlap,
+                        splitter=ingest_options.splitter,
+                        normalize_whitespace=False,  # Already normalized
+                        lowercase=ingest_options.lowercase,
+                        max_chunks=ingest_options.max_chunks
+                    )
+                    
+                    # Add metadata to each chunk
+                    for chunk_idx, chunk in enumerate(chunks):
+                        # Ensure filename is present in metadata for downstream consumers
+                        # Prefer explicit 'filename' while preserving existing 'file_name' if present
+                        source_file_name = (part.metadata or {}).get("file_name", file.filename or "unknown")
+                        chunk_metadata = {
+                            **(part.metadata or {}),
+                            **(ingest_options.metadata or {}),
+                            "filename": source_file_name,
+                            "chunk_index": chunk_idx,
+                            "part_index": part_idx,
+                            "chunk_size": len(chunk)
+                        }
+                        file_chunks.append((chunk, chunk_metadata))
+                
+                chunk_time_file = time.time() - chunk_start_file
+                logger.debug(f"Chunked {file.filename} into {len(file_chunks)} chunks in {chunk_time_file:.2f}s")
+                
+                # Apply max_chunks limit if specified
+                if ingest_options.max_chunks and len(file_chunks) > ingest_options.max_chunks:
+                    file_chunks = file_chunks[:ingest_options.max_chunks]
+                    file_warnings.append(f"Limited chunks to {ingest_options.max_chunks}")
+                
+                if not file_chunks:
+                    file_warnings.append("No chunks generated after processing")
+                    results.append(FileIngestResult(
+                        file_name=file.filename or "unknown",
+                        num_chunks=0,
+                        num_embeddings=0,
+                        warnings=file_warnings
+                    ))
+                    continue
+                
+                all_chunks.extend(file_chunks)
+                file_result = FileIngestResult(
+                    file_name=file.filename or "unknown",
+                    num_chunks=len(file_chunks),
+                    num_embeddings=len(file_chunks),  # Will be updated after embedding generation
+                    metadata={
+                        **(ingest_options.metadata or {}),
+                        "extraction_parts": len(parts)
+                    },
+                    warnings=file_warnings
+                )
+                
+            except ValueError as e:
+                # File type or extraction error
+                results.append(FileIngestResult(
+                    file_name=file.filename or "unknown",
+                    num_chunks=0,
+                    num_embeddings=0,
+                    warnings=[str(e)]
+                ))
+            except Exception as e:
+                logger.error(f"Error processing file {file.filename}: {e}", exc_info=True)
+                results.append(FileIngestResult(
+                    file_name=file.filename or "unknown",
+                    num_chunks=0,
+                    num_embeddings=0,
+                    warnings=[f"Processing error: {str(e)}"]
+                ))
+            
+            if file_result:
+                results.append(file_result)
+        
+        extract_time = time.time() - extract_start
+        logger.debug(f"File extraction and chunking completed in {extract_time:.2f}s, {len(all_chunks)} total chunks")
+        
+        if not all_chunks:
+            return FileIngestResponse(
+                results=results,
+                total_files=len(files),
+                total_chunks=0,
+                total_embeddings=0
+            )
+        
+        # Generate embeddings in batches
+        embed_start = time.time()
+        chunk_texts = [chunk for chunk, _ in all_chunks]
+        
+        try:
+            embeddings = await embedding_service.generate_embeddings(chunk_texts)
+        except Exception as e:
+            logger.error(f"Failed to generate embeddings: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to generate embeddings: {str(e)}")
+        
+        embed_time = time.time() - embed_start
+        logger.debug(f"Generated {len(embeddings)} embeddings in {embed_time:.2f}s")
+        
+        if len(embeddings) != len(all_chunks):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Embedding count mismatch: expected {len(all_chunks)}, got {len(embeddings)}"
+            )
+        
+        # Batch insert embeddings
+        insert_start = time.time()
+        fields = settings.db_fields
+        table_name = settings.table_names["embeddings"]
+        
+        # Build batch insert query
+        values_clauses = []
+        params = []
+        param_count = 1
+        
+        for (chunk, chunk_metadata), embedding in zip(all_chunks, embeddings):
+            embedding_vector_str = "[" + ",".join(map(str, embedding)) + "]"
+            values_clauses.append(
+                f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}::vector, ${param_count + 3}, NOW())"
+            )
+            params.extend([
+                vector_store_id,
+                chunk,
+                embedding_vector_str,
+                chunk_metadata or {}
+            ])
+            param_count += 4
+            total_content_length += len(chunk)
+        
+        values_clause = ", ".join(values_clauses)
+        
+        # Execute batch insert
+        try:
+            await db.query_raw(
+                f"""
+                INSERT INTO {table_name} ({fields.id_field}, {fields.vector_store_id_field}, {fields.content_field}, 
+                                         {fields.embedding_field}, {fields.metadata_field}, {fields.created_at_field})
+                VALUES {values_clause}
+                """,
+                *params
+            )
+        except Exception as e:
+            logger.error(f"Failed to insert embeddings: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to insert embeddings: {str(e)}")
+        
+        insert_time = time.time() - insert_start
+        logger.debug(f"Inserted {len(all_chunks)} embeddings in {insert_time:.2f}s")
+        
+        # Update vector store statistics
+        await db.query_raw(
+            f"""
+            UPDATE {vector_store_table} 
+            SET file_counts = jsonb_set(
+                    jsonb_set(
+                        COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
+                        '{{completed}}',
+                        (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
+                    ),
+                    '{{total}}',
+                    (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
+                ),
+                usage_bytes = COALESCE(usage_bytes, 0) + $3,
+                last_active_at = NOW()
+            WHERE id = $1
+            """,
+            vector_store_id,
+            len(all_chunks),
+            total_content_length
+        )
+        
+        # Update results with actual embedding counts
+        for result in results:
+            if result.num_chunks > 0:
+                result.num_embeddings = result.num_chunks
+        
+        response = FileIngestResponse(
+            results=results,
+            total_files=len(files),
+            total_chunks=len(all_chunks),
+            total_embeddings=len(all_chunks)
+        )
+        
+        # Log metrics asynchronously
+        response_time_ms = int((time.time() - start_time) * 1000)
+        asyncio.create_task(
+            log_metrics_async(vector_store_id, "ingest_files", "POST", response_time_ms, status_code)
+        )
+        
+        return response
+        
+    except HTTPException as e:
+        status_code = e.status_code
+        response_time_ms = int((time.time() - start_time) * 1000)
+        asyncio.create_task(
+            log_metrics_async(vector_store_id, "ingest_files", "POST", response_time_ms, status_code)
+        )
+        raise
+    except Exception as e:
+        status_code = 500
+        response_time_ms = int((time.time() - start_time) * 1000)
+        asyncio.create_task(
+            log_metrics_async(vector_store_id, "ingest_files", "POST", response_time_ms, status_code)
+        )
+        logger.error(f"Failed to ingest files: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to ingest files: {str(e)}")
+
+
+@app.get("/v1/vector_stores/{vector_store_id}/embeddings", response_model=EmbeddingListResponse)
+async def list_embeddings(
+    vector_store_id: str,
+    limit: Optional[int] = 20,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    List embeddings for a vector store with keyset pagination.
+    Supports limit, after, before using the embedding id for pagination.
+    """
+    try:
+        limit = min(limit or 20, 100)
+        # Validate store exists
+        vector_store_table = settings.table_names["vector_stores"]
+        store_check = await db.query_raw(
+            f"SELECT id FROM {vector_store_table} WHERE id = $1",
+            vector_store_id
+        )
+        if not store_check:
+            raise HTTPException(status_code=404, detail="Vector store not found")
+
+        fields = settings.db_fields
+        table_name = settings.table_names["embeddings"]
+
+        conditions = [f"{fields.vector_store_id_field} = $1"]
+        params = [vector_store_id]
+        param_count = 2
+
+        # after/before based on id for simplicity; created_at secondary sort
+        if after:
+            conditions.append(f"{fields.id_field} < $${param_count}$$")
+            params.append(after)
+            param_count += 1
+        if before:
+            conditions.append(f"{fields.id_field} > $${param_count}$$")
+            params.append(before)
+            param_count += 1
+
+        where_clause = " AND ".join(conditions)
+
+        query = f"""
+        SELECT {fields.id_field}, {fields.vector_store_id_field}, {fields.content_field},
+               {fields.metadata_field}, EXTRACT(EPOCH FROM {fields.created_at_field})::bigint as created_at_timestamp
+        FROM {table_name}
+        WHERE {where_clause}
+        ORDER BY {fields.created_at_field} DESC, {fields.id_field} DESC
+        LIMIT $${param_count}$$
+        """
+        params.append(limit + 1)  # Fetch one extra to see if there's more
+
+        rows = await db.query_raw(query, *params)
+
+        items = [
+            EmbeddingListItem(
+                id=row[fields.id_field],
+                vector_store_id=row[fields.vector_store_id_field],
+                content=row[fields.content_field],
+                metadata=row[fields.metadata_field],
+                created_at=int(row["created_at_timestamp"])
+            ) for row in rows[:limit]
+        ]
+
+        has_more = len(rows) > limit
+        last_id = items[-1].id if items else None
+
+        return EmbeddingListResponse(
+            data=items,
+            last_id=last_id,
+            has_more=has_more
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to list embeddings: {str(e)}")
 
 
 @app.delete("/v1/vector_stores/{vector_store_id}/embeddings/{embedding_id}", response_model=EmbeddingDeleteResponse)
@@ -1904,3 +2408,9 @@ async def test_connectivity():
 
 
 app.include_router(admin_router)
+
+
+# Optional compatibility alias for OpenAPI under versioned path
+@app.get("/v1/openapi.json")
+async def openapi_alias():
+    return app.openapi()

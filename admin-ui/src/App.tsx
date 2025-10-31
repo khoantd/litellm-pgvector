@@ -6,6 +6,7 @@ import { Card, CardContent, CardFooter, CardHeader, CardTitle } from './componen
 import { Tabs, TabsList, TabsTrigger, TabsContent } from './components/ui/tabs'
 import { Toaster, toast } from 'sonner'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from './components/ui/dialog'
+import { FileUploader } from './components/FileUploader'
 
 type Settings = {
   server: { host: string; port: number }
@@ -223,10 +224,12 @@ export function App() {
     return () => { cancelled = true }
   }, [])
 
-  // Load vector stores
+  // Load vector stores when relevant tabs are active
   useEffect(() => {
-    if (!apiKey || activeTab !== 'stores') return
-    loadVectorStores()
+    if (!apiKey) return
+    if (['stores', 'search', 'analytics'].includes(activeTab)) {
+      loadVectorStores()
+    }
   }, [apiKey, activeTab])
 
   // Load embeddings when store selected
@@ -296,10 +299,8 @@ export function App() {
   async function loadEmbeddings(storeId: string) {
     setLoadingEmbeddings(true)
     try {
-      // Note: There's no list endpoint yet, so we'll use search with empty query as workaround
-      // Or we can show a message that this requires search
-      setEmbeddings([])
-      toast.info('Use Search Testing tab to find embeddings')
+      const res = await apiPublic<{ data: Embedding[]; last_id?: string; has_more: boolean }>(`/v1/vector_stores/${storeId}/embeddings?limit=50`)
+      setEmbeddings(res.data || [])
     } catch (e: any) {
       toast.error('Failed to load embeddings')
     } finally {
@@ -467,13 +468,14 @@ export function App() {
         </div>
       </header>
 
-      {apiKey && (
+          {apiKey && (
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full mt-6">
           <div className="mb-6">
             <TabsList className="w-full flex gap-1">
               <TabsTrigger value="settings" className="flex-1">Settings</TabsTrigger>
               <TabsTrigger value="stores" className="flex-1">Vector Stores</TabsTrigger>
               <TabsTrigger value="embeddings" className="flex-1">Embeddings</TabsTrigger>
+              <TabsTrigger value="upload" className="flex-1">File Upload</TabsTrigger>
               <TabsTrigger value="analytics" className="flex-1">Analytics</TabsTrigger>
               <TabsTrigger value="search" className="flex-1">Search Testing</TabsTrigger>
             </TabsList>
@@ -631,7 +633,7 @@ export function App() {
             <Card>
               <CardHeader>
                 <CardTitle>Embeddings</CardTitle>
-                <p className="text-sm text-muted-foreground">Select a vector store to view embeddings</p>
+                <p className="text-sm text-muted-foreground">Select a vector store to view and manage embeddings</p>
               </CardHeader>
               <CardContent>
                 {!selectedStore ? (
@@ -644,20 +646,67 @@ export function App() {
                       <div className="font-medium">Selected Store: {vectorStores.find(s => s.id === selectedStore)?.name || selectedStore}</div>
                       <Button variant="outline" size="sm" className="mt-2" onClick={() => setSelectedStore(null)}>Change Store</Button>
                     </div>
-                    <div className="text-center py-8 text-muted-foreground">
-                      Use the Search Testing tab to find and manage embeddings. List view coming soon.
-                    </div>
+                    {loadingEmbeddings ? (
+                      <div className="text-center py-8 text-muted-foreground">Loading embeddings…</div>
+                    ) : embeddings.length === 0 ? (
+                      <div className="text-center py-8 text-muted-foreground">No embeddings found in this store.</div>
+                    ) : (
+                      <div className="space-y-3">
+                        {embeddings.map((emb) => (
+                          <div key={emb.id} className="p-4 border rounded-lg">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="text-sm text-muted-foreground">ID: {emb.id}</div>
+                                <div className="mt-2 text-sm line-clamp-3">{emb.content}</div>
+                                {emb.metadata && <div className="mt-2 text-xs text-muted-foreground">{JSON.stringify(emb.metadata)}</div>}
+                              </div>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => deleteEmbedding(selectedStore!, emb.id)}
+                              >
+                                Delete
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </CardContent>
             </Card>
           </TabsContent>
 
+          <TabsContent value="upload" className="space-y-6">
+            <div className="grid gap-4 mb-4">
+              <Label htmlFor="upload-store-id">Vector Store ID</Label>
+              <Input
+                id="upload-store-id"
+                placeholder="Enter vector store ID"
+                value={selectedStore || ''}
+                onChange={e => setSelectedStore(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Enter the ID of the vector store where embeddings will be created
+              </p>
+            </div>
+            <FileUploader
+              vectorStoreId={selectedStore || ''}
+              apiKey={apiKey}
+              apiBase={apiBase}
+              onSuccess={() => {
+                // Reload vector stores to update stats
+                loadVectorStores()
+              }}
+            />
+          </TabsContent>
+
           <TabsContent value="analytics" className="space-y-6">
             <Card>
               <CardHeader className="flex flex-row items-center justify-between">
                 <CardTitle>Analytics & Monitoring</CardTitle>
-                <div className="flex gap-2">
+                <div className="flex gap-2 items-center">
                   <select
                     value={statsPeriod}
                     onChange={e => setStatsPeriod(e.target.value as typeof statsPeriod)}
@@ -668,7 +717,17 @@ export function App() {
                     <option value="monthly">Monthly</option>
                     <option value="all">All Time</option>
                   </select>
-                  <Button variant="outline" onClick={loadGlobalStats} disabled={loadingStats}>
+                  <select
+                    value={selectedStore || ''}
+                    onChange={e => setSelectedStore(e.target.value || null)}
+                    className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  >
+                    <option value="">All Stores</option>
+                    {vectorStores.map(store => (
+                      <option key={store.id} value={store.id}>{store.name}</option>
+                    ))}
+                  </select>
+                  <Button variant="outline" onClick={() => { loadGlobalStats(); if (selectedStore) loadVectorStoreStats(selectedStore) }} disabled={loadingStats}>
                     {loadingStats ? 'Loading...' : 'Refresh'}
                   </Button>
                 </div>
@@ -761,6 +820,56 @@ export function App() {
                         <h3 className="text-lg font-semibold mb-4">Endpoint Breakdown</h3>
                         <div className="space-y-2">
                           {Object.entries(globalStats.endpoint_stats).map(([endpoint, stats]) => (
+                            <div key={endpoint} className="p-4 border rounded-lg">
+                              <div className="font-medium mb-2">{endpoint}</div>
+                              <div className="grid grid-cols-3 gap-4 text-sm">
+                                <div>
+                                  <span className="text-muted-foreground">Requests: </span>
+                                  <span className="font-medium">{stats.count}</span>
+                                </div>
+                                <div>
+                                  <span className="text-muted-foreground">Avg Time: </span>
+                                  <span className="font-medium">{stats.avg_response_time_ms.toFixed(1)} ms</span>
+                                </div>
+                                <div>
+                                  <span className="text-muted-foreground">Errors: </span>
+                                  <span className="font-medium">{stats.error_count}</span>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {globalStats?.top_vector_stores && (
+                      <div>
+                        <h3 className="text-lg font-semibold mb-4">Top Vector Stores</h3>
+                        <div className="space-y-2">
+                          {globalStats.top_vector_stores.map((item, idx) => (
+                            <div key={item.vector_store_id} className="p-4 border rounded-lg flex items-center justify-between">
+                              <div className="min-w-0">
+                                <div className="font-medium">{vectorStores.find(v => v.id === item.vector_store_id)?.name || item.vector_store_id}</div>
+                                <div className="text-sm text-muted-foreground">Requests: {item.request_count} • Avg {item.avg_response_time_ms.toFixed(1)} ms</div>
+                              </div>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setSelectedStore(item.vector_store_id)}
+                              >
+                                View
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {selectedStore && vectorStoreStats?.endpoint_stats && (
+                      <div>
+                        <h3 className="text-lg font-semibold mb-4">Endpoint Breakdown (Selected Store)</h3>
+                        <div className="space-y-2">
+                          {Object.entries(vectorStoreStats.endpoint_stats).map(([endpoint, stats]) => (
                             <div key={endpoint} className="p-4 border rounded-lg">
                               <div className="font-medium mb-2">{endpoint}</div>
                               <div className="grid grid-cols-3 gap-4 text-sm">
