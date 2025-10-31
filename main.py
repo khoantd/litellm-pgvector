@@ -425,13 +425,14 @@ async def list_vector_stores(
         params = []
         param_count = 1
         
+        # Use text cast comparisons for robust pagination across uuid/text ids
         if after:
-            conditions.append(f"id > ${param_count}")
+            conditions.append(f"id::text > ${param_count}")
             params.append(after)
             param_count += 1
             
         if before:
-            conditions.append(f"id < ${param_count}")
+            conditions.append(f"id::text < ${param_count}")
             params.append(before)
             param_count += 1
         
@@ -620,6 +621,9 @@ async def search_vector_store(
         # Convert results to SearchResult objects
         search_results = []
         for row in results:
+            # Guard: prisma.query_raw can return None entries in some environments
+            if not row:
+                continue
             # Get score based on search mode
             if search_mode == "hybrid":
                 score = float(row.get('final_score', 0.0))
@@ -630,13 +634,14 @@ async def search_vector_store(
                 score = float(row.get('keyword_score', 0.0))
             
             # Extract filename from metadata or use a default
-            metadata = row[fields.metadata_field] or {}
+            metadata = (row.get(fields.metadata_field) or {})
             filename = metadata.get('filename', 'document.txt')
             
-            content_chunks = [ContentChunk(type="text", text=row[fields.content_field])]
+            content_text = row.get(fields.content_field, "")
+            content_chunks = [ContentChunk(type="text", text=content_text)]
             
             result = SearchResult(
-                file_id=row[fields.id_field],
+                file_id=row.get(fields.id_field, ""),
                 filename=filename,
                 score=score,
                 attributes=metadata if request.return_metadata else None,
